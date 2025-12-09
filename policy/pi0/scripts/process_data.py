@@ -45,8 +45,13 @@ def images_encoding(imgs):
     return encode_data, max_len
 
 
-def get_task_config(task_name):
-    with open(f"./task_config/{task_name}.yml", "r", encoding="utf-8") as f:
+def get_task_config(task_name, setting):
+    # Look for task config in the RoboTwin root directory
+    config_path = os.path.join(os.path.dirname(__file__), "../../../task_config", f"{setting}.yml")
+    if not os.path.exists(config_path):
+        # Fallback to old path
+        config_path = f"./task_config/{setting}.yml"
+    with open(config_path, "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
     return args
 
@@ -167,12 +172,16 @@ if __name__ == "__main__":
     setting = args.setting
     expert_data_num = args.expert_data_num
 
-    load_dir = os.path.join("../../data", str(task_name), str(setting))
+    # Load task config to get the save_path
+    task_config = get_task_config(task_name, setting)
+    base_save_path = task_config.get("save_path", "../../data")
+    
+    load_dir = os.path.join(base_save_path, str(task_name), str(setting))
 
     begin = 0
-    print(f'read data from path:{os.path.join("data", load_dir)}')
+    print(f'read data from path:{load_dir}')
 
-    target_dir = f"processed_data/{task_name}-{setting}-{expert_data_num}"
+    target_dir = os.path.join(base_save_path, "processed_data", f"{task_name}-{setting}-{expert_data_num}")
     begin = data_transform(
         load_dir,
         expert_data_num,

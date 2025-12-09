@@ -138,7 +138,12 @@ def load_task_instructions(task_name: str) -> Dict[str, Any]:
 
 def load_scene_info(task_name: str, setting: str, scene_info_path: str) -> Dict[str, Dict]:
     """Load the scene info from the JSON file in the data directory."""
-    file_path = os.path.join(parent_directory, f"../../{scene_info_path}/{task_name}/{setting}/scene_info.json")
+    # Handle both absolute and relative paths
+    if os.path.isabs(scene_info_path):
+        file_path = os.path.join(scene_info_path, task_name, setting, "scene_info.json")
+    else:
+        file_path = os.path.join(parent_directory, f"../../{scene_info_path}/{task_name}/{setting}/scene_info.json")
+    
     try:
         with open(file_path, "r") as f:
             scene_data = json.load(f)
@@ -162,9 +167,14 @@ def extract_episodes_from_scene_info(scene_info: Dict) -> List[Dict[str, str]]:
     return episodes
 
 
-def save_episode_descriptions(task_name: str, setting: str, generated_descriptions: List[Dict]):
+def save_episode_descriptions(task_name: str, setting: str, generated_descriptions: List[Dict], save_path: str = None):
     """Save generated descriptions to output files."""
-    output_dir = os.path.join(parent_directory, f"../../data/{task_name}/{setting}/instructions")
+    if save_path and os.path.isabs(save_path):
+        # Use absolute path from config
+        output_dir = os.path.join(save_path, task_name, setting, "instructions")
+    else:
+        # Fallback to relative path
+        output_dir = os.path.join(parent_directory, f"../../data/{task_name}/{setting}/instructions")
     os.makedirs(output_dir, exist_ok=True)
 
     for episode_desc in generated_descriptions:
@@ -272,5 +282,5 @@ if __name__ == "__main__":
     results = generate_episode_descriptions(args.task_name, episodes, args.max_num)
 
     # Save results to output files
-    save_episode_descriptions(args.task_name, args.setting, results)
+    save_episode_descriptions(args.task_name, args.setting, results, args_dict['save_path'])
     print("Successfully Saved Instructions")
