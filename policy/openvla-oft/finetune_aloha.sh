@@ -1,5 +1,7 @@
 # In experiments, global batch size of less than 16 will easily lead to unsuccessful training, where the training and validation 
 # loss would not converge low enough, and the final policy would repeat one trajectory regardless of the visual and language inputs.
+export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+export WANDB_MODE=offline
 torchrun --standalone --nnodes 1 --nproc-per-node 2 vla-scripts/finetune.py \
   --vla_path openvla/openvla-7b \
   --data_root_dir somepath/tensorflow_datasets/ \
