@@ -102,4 +102,9 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
         if k not in result:
             result[k] = flat_ref[k]
 
+    # Additionally, merge all missing weights that are not in loaded_params (for new modules)
+    for k, v in flat_ref.items():
+        if k not in result:
+            result[k] = v
+
     return flax.traverse_util.unflatten_dict(result, sep="/")
