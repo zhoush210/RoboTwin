@@ -37,11 +37,11 @@ bash generate.sh /mnt/nvme1/shihuiz/robotwin/processed_data/ demo_clean
 # 统计数据
 uv run scripts/compute_norm_stats.py --config-name pi0_base_aloha_robotwin_full
 # 训练
-# 修改policy/pi0/src/openpi/training/config.py中的checkpoint_base_dir（ckpt的保存地址）
+# 修改policy/pi0/src/openpi/training/config.py中的 checkpoint_base_dir （ckpt的保存地址）
 bash finetune.sh pi0_base_aloha_robotwin_full demo_clean 0,1,2,3
 # 推理
 # 修改policy/pi0/deploy_policy.yml中的配置，尤其是ckpt
-bash eval.sh beat_block_hammer demo_clean pi0_base_aloha_robotwin_full demo_clean 0 0
+bash eval.sh blocks_ranking_rgb demo_clean pi0_base_aloha_robotwin_full demo_clean 0 0
 ```
 
 ## openvla
@@ -57,3 +57,9 @@ python preprocess_aloha.py \
 # 验证：
 python -m datasets.blocks_ranking_rgb_builder
 ```
+ ## MemoryPi0
+ 安装：
+ 除了按照pi0的步骤安装以外，还要在policy/MemoryPi0下运行：
+ ```bash
+ uv pip install -e .
+ ```

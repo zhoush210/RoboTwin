@@ -224,12 +224,57 @@ class BaseModelConfig(abc.ABC):
 
     def load(self, params: at.Params, *, remove_extra_params: bool = True) -> "BaseModel":
         """Create a model with the given parameters."""
+        # DEBUG: Disable remove_extra_params due to intersect_trees issue
+        remove_extra_params = False
+        
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
         if remove_extra_params:
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
-        state.replace_by_pure_dict(params)
+        
+        # WORKAROUND: replace_by_pure_dict doesn't work with VariableState containing nested dicts
+        # Manually update the state by replacing VariableState values
+        from flax import traverse_util
+        from flax.nnx import traversals
+        
+        flat_state = state.flat_state()
+        flat_params = traversals.flatten_mapping(params)
+        
+        # Group flat_params by their state key (handle nested dicts in VariableState)
+        state_updates = {}
+        for param_key, param_value in flat_params.items():
+            # Find the corresponding state key by checking prefixes
+            # e.g., ('bank', 'counts') should map to state key ('bank',)
+            for state_key in flat_state.keys():
+                if param_key[:len(state_key)] == state_key:
+                    # This param belongs to this state key
+                    if state_key not in state_updates:
+                        state_updates[state_key] = {}
+                    # Store the suffix path and value
+                    suffix = param_key[len(state_key):]
+                    if suffix:
+                        # Nested dict case - build the dict structure
+                        current = state_updates[state_key]
+                        for key in suffix[:-1]:
+                            if key not in current:
+                                current[key] = {}
+                            current = current[key]
+                        current[suffix[-1]] = param_value
+                    else:
+                        # Direct value case
+                        state_updates[state_key] = param_value
+                    break
+        
+        # Now update flat_state with the grouped values
+        for state_key, value in state_updates.items():
+            state_var = flat_state[state_key]
+            if hasattr(state_var, 'replace'):
+                flat_state[state_key] = state_var.replace(value)
+            else:
+                flat_state[state_key] = value
+        
+        state.update(traversals.unflatten_mapping(flat_state))
         return nnx.merge(graphdef, state)
 
     @abc.abstractmethod
@@ -304,18 +349,44 @@ def restore_params(
         metadata = ckptr.metadata(params_path)
         item = {"params": metadata["params"]}
 
+        # Create restore args that preserve integer dtypes
+        def make_restore_args(meta):
+            # Preserve integer dtypes, only convert floating point types to target dtype
+            target_dtype = dtype
+            if dtype is not None and hasattr(meta, 'dtype'):
+                # Check if the original dtype is integer
+                if jnp.issubdtype(meta.dtype, jnp.integer):
+                    target_dtype = None  # Keep original integer dtype
+            return ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=target_dtype)
+
         params = ckptr.restore(
             params_path,
             ocp.args.PyTreeRestore(
                 item=item,
-                restore_args=jax.tree.map(
-                    lambda _: ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=dtype), item),
+                restore_args=jax.tree.map(make_restore_args, item),
             ),
         )["params"]
 
-    # If the params were saved with `save_state` during openpi training, every key path will end with "value", which is
-    # added by `nnx.State`. We remove the "value" suffix here and always return what NNX calls a "pure dict".
+    # If the params were saved with `save_state` during openpi training, key paths ending with "value" 
+    # should have that suffix removed (it's added by `nnx.State`).
+    # Also remove 'value' that appears right after 'bank' (VariableState wrapper)
     flat_params = traverse_util.flatten_dict(params)
-    if all(kp[-1] == "value" for kp in flat_params):
-        flat_params = {kp[:-1]: v for kp, v in flat_params.items()}
-    return traverse_util.unflatten_dict(flat_params)
+    cleaned_flat_params = {}
+    for kp, v in flat_params.items():
+        cleaned_kp = list(kp)
+        
+        # Remove final 'value' if present
+        if cleaned_kp and cleaned_kp[-1] == 'value':
+            cleaned_kp = cleaned_kp[:-1]
+        
+        # Remove 'value' right after 'bank' (VariableState structure)
+        # bank/value/counts -> bank/counts
+        for i in range(len(cleaned_kp) - 1):
+            if cleaned_kp[i] == 'bank' and cleaned_kp[i+1] == 'value':
+                cleaned_kp.pop(i+1)
+                break
+        
+        cleaned_kp = tuple(cleaned_kp)
+        if len(cleaned_kp) > 0:
+            cleaned_flat_params[cleaned_kp] = v
+    return traverse_util.unflatten_dict(cleaned_flat_params)

@@ -29,7 +29,7 @@ class TimestepEmbedder(nnx.Module):
     def timestep_embedding(self, t, dim, max_period=10000):
         half = dim // 2
         freqs = jnp.exp(-jnp.log(max_period) * jnp.arange(0, half, dtype=jnp.float32) / half)
-        args = t[:, None].float() * freqs[None]
+        args = jnp.asarray(t[:, None], dtype=jnp.float32) * freqs[None]
         return jnp.concatenate([jnp.sin(args), jnp.cos(args)], axis=-1)
 
     def __call__(self, t):
@@ -50,11 +50,22 @@ class CrossTransformerBlock(nnx.Module):
         self.ffn_2 = nnx.Linear(feature_dim * 4, feature_dim, rngs=rngs)
         self.ffn_norm = nnx.LayerNorm(feature_dim, rngs=rngs)
 
-    def __call__(self, query, k, v):
+    def __call__(self, query, k, v, mask=None):
         q = self.q_proj(query)
         k = self.k_proj(k)
         v = self.v_proj(v)
-        attn_out = nnx.scaled_dot_product_attention(q, k, v, is_causal=False)
+        # Reshape for attention: (batch, seq, 1, D)
+        q = q[:, :, None, :]
+        k = k[:, :, None, :]
+        v = v[:, :, None, :]
+        # Attention
+        head_dim = q.shape[-1]
+        attn_logits = jnp.einsum('bqhd,bkhd->bhqk', q, k) / jnp.sqrt(head_dim)
+        if mask is not None:
+            attn_logits = jnp.where(mask, attn_logits, -jnp.inf)
+        attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+        attn_out = jnp.einsum('bhqk,bkhd->bqhd', attn_weights, v)
+        attn_out = attn_out[:, :, 0, :]  # (batch, seq_q, D)
         x = self.attn_norm(query + attn_out)
         # 使用显式层
         ffn_out = self.ffn_2(nnx.gelu(self.ffn_1(x)))
@@ -101,7 +112,7 @@ class GateFusion(nnx.Module):
 
 # 认知记忆库类，用于管理认知特征的记忆
 class CogMemBank(nnx.Module):
-    def __init__(self, dataloader_type, group_size, token_size, mem_length=16, retrieval_layers=2, use_timestep_pe=True, fusion_type='gate', consolidate_type='tome', update_fused=False, rngs=None):
+    def __init__(self, dataloader_type, group_size, token_size, mem_length=16, retrieval_layers=2, use_timestep_pe=True, fusion_type='gate', consolidate_type='tome', update_fused=False, max_episodes=1000, rngs=None):
         assert dataloader_type in ('stream', 'group')
         assert fusion_type in ('gate', 'add')
         assert consolidate_type in ('fifo', 'tome')
@@ -115,6 +126,8 @@ class CogMemBank(nnx.Module):
         self.fusion_type = fusion_type
         self.consolidate_type = consolidate_type
         self.update_fused = update_fused
+        self.max_episodes = max_episodes
+        self.N = 1  # For cognitive memory, N=1
 
         # 检索块 - 使用字典而不是列表来避免索引键问题
         self.retrieval_blocks = {}
@@ -129,24 +142,121 @@ class CogMemBank(nnx.Module):
         else:
             self.timestep_encoder = None
 
-        # 移除状态变量，避免参数结构问题
-        # self.bank = nnx.Variable({})  # episode_id to list of (timestep, feat)
-        # self.eid_stream = nnx.Variable(None)
+        # 记忆库状态变量，使用数组结构以支持JAX
+        self.bank = nnx.Variable({
+            'feats': jnp.zeros((self.max_episodes, self.mem_length, self.token_size)),  # N=1 for cog
+            'timesteps': jnp.zeros((self.max_episodes, self.mem_length)),
+            'counts': jnp.zeros(self.max_episodes, dtype=jnp.int32)
+        })
+        self.eid_stream = nnx.Variable(None)
 
     def reset(self):
         # 由于移除了状态变量，这个方法现在为空
         pass
 
+    def _compute_retrieved(self, current_bank, eid, working_mem):
+        count = current_bank['counts'][eid]
+        # Slice to max_length
+        hist_feats = current_bank['feats'][eid]  # (mem_length, token_size) for Cog, (mem_length, N, token_size) for Per
+        hist_timesteps = current_bank['timesteps'][eid]  # (mem_length,)
+        episode_mem = hist_feats.reshape(-1, self.token_size)[None]  # (1, mem_length*self.N, D)
+
+        if self.use_timestep_pe:
+            pe = self.timestep_encoder(hist_timesteps)[None]  # (1, mem_length, D)
+            pe = jnp.repeat(pe, self.N, axis=1)  # (1, mem_length*self.N, D)
+        else:
+            pe = jnp.zeros_like(episode_mem)
+
+        # Create mask for valid tokens
+        seq_len_kv = self.mem_length * self.N
+        valid_mask = jnp.arange(seq_len_kv) < count * self.N
+        mask = valid_mask[None, None, None, :]  # (1, 1, 1, seq_len_kv)
+
+        query = working_mem
+        for block_key in self.retrieval_blocks:
+            block = self.retrieval_blocks[block_key]
+            query = block(query, episode_mem + pe, episode_mem, mask=mask)
+        return query
+
+    def _consolidate(self, feats, eid, feat_to_store):
+        old = feats[eid]
+        new = jnp.concatenate([old[1:], feat_to_store[None]], axis=0)
+        return feats.at[eid].set(new)
+
+    def _consolidate_timesteps(self, timesteps, eid, new_t):
+        old = timesteps[eid]
+        new = jnp.concatenate([old[1:], jnp.array([new_t])], axis=0)
+        return timesteps.at[eid].set(new)
+
     def process_batch(self, tokens, episode_ids, timesteps):
-        # 简化实现：暂时直接返回输入tokens
-        # 在完整的实现中，这里应该包含记忆检索和融合逻辑
-        # 但为了避免参数结构问题，我们先简化
-        return tokens
+        # 实现记忆机制：检索和融合历史记忆
+        B, N, D = tokens.shape
+        outputs = []
+        current_bank = self.bank.value.copy()
+
+        for i in range(B):
+            eid = episode_ids[i]
+            working_mem = tokens[i:i+1]  # (1, N, D)
+            count = current_bank['counts'][eid].astype(jnp.int32)  # Ensure count is int32 for indexing
+
+            retrieved = jax.lax.cond(
+                count > 0,
+                lambda: self._compute_retrieved(current_bank, eid, working_mem).astype(working_mem.dtype),
+                lambda: working_mem
+            )
+
+            # 融合
+            if self.fusion_type == 'add':
+                fused = (working_mem + retrieved) * 0.5
+            elif self.fusion_type == 'gate':
+                fused = self.gate_fusion_blocks(working_mem, retrieved)
+
+            outputs.append(fused)
+
+            # 巩固记忆
+            feat_to_store = jax.lax.cond(self.update_fused, lambda: fused.squeeze(0), lambda: tokens[i])
+            if self.N == 1:
+                feat_to_store = feat_to_store[0]
+            new_count = jax.lax.cond(
+                count < self.mem_length,
+                lambda: count + 1,
+                lambda: count
+            )
+            new_feats = jax.lax.cond(
+                count < self.mem_length,
+                lambda: current_bank['feats'].at[eid, count].set(feat_to_store),
+                lambda: self._consolidate(current_bank['feats'], eid, feat_to_store)
+            )
+            new_timesteps = jax.lax.cond(
+                self.use_timestep_pe,
+                lambda: jax.lax.cond(
+                    count < self.mem_length,
+                    lambda: current_bank['timesteps'].at[eid, count].set(timesteps[i]),
+                    lambda: self._consolidate_timesteps(current_bank['timesteps'], eid, timesteps[i])
+                ),
+                lambda: current_bank['timesteps']
+            )
+            current_bank['feats'] = new_feats
+            current_bank['timesteps'] = new_timesteps
+            current_bank['counts'] = current_bank['counts'].at[eid].set(new_count)
+
+        # 更新记忆库
+        self.bank.value = current_bank
+        return jnp.concatenate(outputs, axis=0)
 
 
 # 感知记忆库类，继承自CogMemBank，用于管理感知特征的记忆
 class PerMemBank(CogMemBank):
-    pass
+    def __init__(self, dataloader_type, group_size, token_size, mem_length=16, retrieval_layers=2, use_timestep_pe=True, fusion_type='gate', consolidate_type='tome', update_fused=False, max_episodes=1000, rngs=None):
+        # 调用父类构造函数，但重写bank
+        super().__init__(dataloader_type, group_size, token_size, mem_length, retrieval_layers, use_timestep_pe, fusion_type, consolidate_type, update_fused, max_episodes, rngs)
+        # 重写bank以适应感知特征的形状 (max_episodes, mem_length, 768, token_size)
+        self.N = 768  # 固定序列长度
+        self.bank = nnx.Variable({
+            'feats': jnp.zeros((self.max_episodes, self.mem_length, self.N, self.token_size)),
+            'timesteps': jnp.zeros((self.max_episodes, self.mem_length)),
+            'counts': jnp.zeros(self.max_episodes, dtype=jnp.int32)
+        })
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -232,6 +342,7 @@ class Pi0Config(_model.BaseModelConfig):
     fusion_type: str = 'gate'
     consolidate_type: str = 'tome'
     update_fused: bool = False
+    max_episodes: int = 1000
 
     @property
     @override
@@ -271,6 +382,35 @@ class Pi0Config(_model.BaseModelConfig):
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
         return observation_spec, action_spec
+
+    @override
+    def create_dummy_inputs(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
+        # 创建假输入用于测试
+        image_shape = (batch_size, *_model.IMAGE_RESOLUTION, 3)
+        images = {
+            "base_0_rgb": jnp.zeros(image_shape, jnp.float32),
+            "left_wrist_0_rgb": jnp.zeros(image_shape, jnp.float32),
+            "right_wrist_0_rgb": jnp.zeros(image_shape, jnp.float32),
+        }
+        image_masks = {
+            "base_0_rgb": jnp.ones((batch_size,), jnp.bool_),
+            "left_wrist_0_rgb": jnp.ones((batch_size,), jnp.bool_),
+            "right_wrist_0_rgb": jnp.ones((batch_size,), jnp.bool_),
+        }
+        state = jnp.zeros((batch_size, self.action_dim), jnp.float32)
+        tokenized_prompt = jnp.zeros((batch_size, self.max_token_len), jnp.int32)
+        tokenized_prompt_mask = jnp.ones((batch_size, self.max_token_len), bool)
+
+        observation = _model.Observation(
+            images=images,
+            image_masks=image_masks,
+            state=state,
+            tokenized_prompt=tokenized_prompt,
+            tokenized_prompt_mask=tokenized_prompt_mask,
+        )
+        actions = jnp.zeros((batch_size, self.action_horizon, self.action_dim), jnp.float32)
+
+        return observation, actions
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         """Returns the freeze filter based on the model config."""
@@ -345,6 +485,7 @@ class Pi0(_model.BaseModel):
 
         # 计算视觉维度
         self.vision_dim = paligemma_config.width  # 图像编码器输出维度
+        self.cog_token_size = 1024  # 认知token大小
 
         # 感知压缩器
         self.per_compr = BottleneckSE(
@@ -354,17 +495,27 @@ class Pi0(_model.BaseModel):
             rngs=rngs,
         )
 
+        # 认知压缩器
+        self.extract_cog_tokens = BottleneckSE(
+            C_in=1024,
+            C_mid=512,
+            C_out=self.cog_token_size,
+            rngs=rngs,
+        )
+        self.cog_proj = nnx.Linear(2048, self.cog_token_size, rngs=rngs)
+
         # 认知记忆库
         self.cog_mem_bank = CogMemBank(
             dataloader_type=config.dataloader_type,
             group_size=config.group_size,
-            token_size=self.action_expert_config.width,
+            token_size=self.cog_token_size,
             mem_length=config.mem_length,
             retrieval_layers=config.retrieval_layers,
             use_timestep_pe=config.use_timestep_pe,
             fusion_type=config.fusion_type,
             consolidate_type=config.consolidate_type,
             update_fused=config.update_fused,
+            max_episodes=config.max_episodes,
             rngs=rngs,
         )
 
@@ -379,6 +530,7 @@ class Pi0(_model.BaseModel):
             fusion_type=config.fusion_type,
             consolidate_type=config.consolidate_type,
             update_fused=config.update_fused,
+            max_episodes=config.max_episodes,
             rngs=rngs,
         )
 
@@ -499,7 +651,7 @@ class Pi0(_model.BaseModel):
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
         (prefix_out, _), _ = self.PaliGemma.llm([prefix_tokens, jnp.zeros((prefix_tokens.shape[0], 1, self.action_expert_config.width))], mask=attn_mask, positions=positions)
-        cog_tokens = prefix_out[:, -1:, :]  # 最后一个token作为认知特征
+        cog_tokens = self.extract_cog_tokens(self.cog_proj(prefix_out[:, -1:, :]))  # 最后一个token作为认知特征
 
         # 记忆库处理
         if episode_ids is None:
@@ -563,7 +715,7 @@ class Pi0(_model.BaseModel):
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
         (prefix_out, _), _ = self.PaliGemma.llm([prefix_tokens, jnp.zeros((prefix_tokens.shape[0], 1, self.action_expert_config.width))], mask=attn_mask, positions=positions)
-        cog_tokens = prefix_out[:, -1:, :]  # 最后一个token作为认知特征
+        cog_tokens = self.extract_cog_tokens(self.cog_proj(prefix_out[:, -1:, :]))  # 最后一个token作为认知特征
 
         # 记忆库处理
         if episode_ids is None:
