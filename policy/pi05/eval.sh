@@ -13,7 +13,7 @@ gpu_id=${6}
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
 
-# source .venv/bin/activate
+source .venv/bin/activate
 cd ../.. # move to root
 
 PYTHONWARNINGS=ignore::UserWarning \

@@ -31,14 +31,16 @@ class PI0:
         self.model_name = model_name
         self.checkpoint_id = checkpoint_id
 
-        specified_path = f"policy/pi05/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}/assets/"
+        config = _config.get_config(self.train_config_name)
+        checkpoint_base_dir = config.checkpoint_base_dir
+        
+        specified_path = f"{checkpoint_base_dir}/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}/assets/"
         entries = os.listdir(specified_path)
         assets_id = entries[0]
 
-        config = _config.get_config(self.train_config_name)
         self.policy = _policy_config.create_trained_policy(
             config,
-            f"policy/pi05/checkpoints/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}",
+            f"{checkpoint_base_dir}/{self.train_config_name}/{self.model_name}/{self.checkpoint_id}",
             robotwin_repo_id=assets_id,
             )
         print("loading model success!")
